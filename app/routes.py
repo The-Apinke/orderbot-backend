@@ -8,7 +8,11 @@ import os
 import io
 from openai import OpenAI
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def get_openai_client():
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    return OpenAI(api_key=key)
 
 router = APIRouter()
 
@@ -45,7 +49,7 @@ async def transcribe(audio: UploadFile = File(...)):
     contents = await audio.read()
     audio_file = io.BytesIO(contents)
     audio_file.name = audio.filename or "audio.webm"
-    transcript = openai_client.audio.transcriptions.create(
+    transcript = get_openai_client().audio.transcriptions.create(
         model="whisper-1",
         file=audio_file,
     )

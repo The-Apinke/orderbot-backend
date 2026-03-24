@@ -120,8 +120,8 @@ class OrderRequest(BaseModel):
     @classmethod
     def phone_must_be_valid(cls, v):
         digits = ''.join(filter(str.isdigit, v))
-        if len(digits) < 10:
-            raise ValueError('Phone number must have at least 10 digits')
+        if len(digits) < 11:
+            raise ValueError('Phone number must have at least 11 digits')
         return v.strip()
 
     @field_validator('total_price')

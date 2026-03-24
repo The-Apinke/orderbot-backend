@@ -1,9 +1,14 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, UploadFile, File
 from pydantic import BaseModel, field_validator
 from app.database import supabase
-from app.agent import get_streaming_response, get_welcome_message
+from app.agent import get_streaming_response, get_welcome_message, has_packaging_instructions, extract_order_inventory, check_inventory_vs_response
 from fastapi.responses import StreamingResponse
 import json
+import os
+import io
+from openai import OpenAI
+
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 router = APIRouter()
 
@@ -35,6 +40,17 @@ def welcome():
     message = get_welcome_message()
     return {"message": message}
 
+@router.post("/chat/transcribe")
+async def transcribe(audio: UploadFile = File(...)):
+    contents = await audio.read()
+    audio_file = io.BytesIO(contents)
+    audio_file.name = audio.filename or "audio.webm"
+    transcript = openai_client.audio.transcriptions.create(
+        model="whisper-1",
+        file=audio_file,
+    )
+    return {"transcript": transcript.text}
+
 @router.post("/chat")
 async def chat(request: ChatRequest):
     menu_response = supabase.table("menu_items").select("*").eq("available", True).execute()
@@ -56,12 +72,31 @@ async def chat(request: ChatRequest):
 
     async def generate():
         full_reply = ""
-        
+
+        # Extract inventory before streaming if complex packaging order detected
+        inventory = {}
+        if has_packaging_instructions(request.message):
+            inventory = extract_order_inventory(request.message)
+
         with get_streaming_response(messages, menu) as stream:
             for text in stream.text_stream:
                 full_reply += text
                 yield f"data: {json.dumps({'token': text})}\n\n"
-        
+
+        # Python code verification — no AI involved
+        if inventory:
+            unassigned = check_inventory_vs_response(inventory, full_reply)
+            if unassigned:
+                items_str = ", ".join(f"{qty}x {item}" for item, qty in unassigned.items())
+                verb = "it doesn't appear" if len(unassigned) == 1 else "they don't appear"
+                pronoun = "that" if len(unassigned) == 1 else "those"
+                correction = (
+                    f"\n\nHold on — you ordered {items_str} but {verb} "
+                    f"in any package above. Which package should {pronoun} go into?"
+                )
+                yield f"data: {json.dumps({'token': correction})}\n\n"
+                full_reply += correction
+
         updated_history = messages + [{"role": "assistant", "content": full_reply}]
         yield f"data: {json.dumps({'done': True, 'conversation_history': updated_history})}\n\n"
 

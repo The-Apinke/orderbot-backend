@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import router
+from app.audit_routes import router as audit_router
 from app.database import supabase
 
 app = FastAPI(title="OrderBot API", version="1.0.0")
@@ -14,6 +15,7 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(audit_router)
 
 @app.get("/")
 def root():

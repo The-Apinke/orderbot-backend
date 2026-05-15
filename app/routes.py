@@ -57,54 +57,66 @@ async def transcribe(audio: UploadFile = File(...)):
 
 @router.post("/chat")
 async def chat(request: ChatRequest):
-    menu_response = supabase.table("menu_items").select("*").eq("available", True).execute()
-    
-    menu = {}
-    for item in menu_response.data:
-        category = item["category"]
-        if category not in menu:
-            menu[category] = []
-        menu[category].append({
-            "name": item["name"],
-            "description": item["description"],
-            "price": item["price"]
-        })
+    try:
+        menu_response = supabase.table("menu_items").select("*").eq("available", True).execute()
 
-    messages = request.conversation_history + [
-        {"role": "user", "content": request.message}
-    ]
+        menu = {}
+        for item in menu_response.data:
+            category = item["category"]
+            if category not in menu:
+                menu[category] = []
+            menu[category].append({
+                "name": item["name"],
+                "description": item["description"],
+                "price": item["price"]
+            })
 
-    async def generate():
-        full_reply = ""
+        messages = request.conversation_history + [
+            {"role": "user", "content": request.message}
+        ]
 
-        # Extract inventory before streaming if complex packaging order detected
-        inventory = {}
-        if has_packaging_instructions(request.message):
-            inventory = extract_order_inventory(request.message)
+        async def generate():
+            full_reply = ""
 
-        with get_streaming_response(messages, menu) as stream:
-            for text in stream.text_stream:
-                full_reply += text
-                yield f"data: {json.dumps({'token': text})}\n\n"
+            try:
+                # Extract inventory before streaming if complex packaging order detected
+                inventory = {}
+                if has_packaging_instructions(request.message):
+                    inventory = extract_order_inventory(request.message)
 
-        # Python code verification — no AI involved
-        if inventory:
-            unassigned = check_inventory_vs_response(inventory, full_reply)
-            if unassigned:
-                items_str = ", ".join(f"{qty}x {item}" for item, qty in unassigned.items())
-                verb = "it doesn't appear" if len(unassigned) == 1 else "they don't appear"
-                pronoun = "that" if len(unassigned) == 1 else "those"
-                correction = (
-                    f"\n\nHold on — you ordered {items_str} but {verb} "
-                    f"in any package above. Which package should {pronoun} go into?"
-                )
-                yield f"data: {json.dumps({'token': correction})}\n\n"
-                full_reply += correction
+                with get_streaming_response(messages, menu) as stream:
+                    for text in stream.text_stream:
+                        full_reply += text
+                        yield f"data: {json.dumps({'token': text})}\n\n"
 
-        updated_history = messages + [{"role": "assistant", "content": full_reply}]
-        yield f"data: {json.dumps({'done': True, 'conversation_history': updated_history})}\n\n"
+                # Python code verification — no AI involved
+                if inventory:
+                    unassigned = check_inventory_vs_response(inventory, full_reply)
+                    if unassigned:
+                        items_str = ", ".join(f"{qty}x {item}" for item, qty in unassigned.items())
+                        verb = "it doesn't appear" if len(unassigned) == 1 else "they don't appear"
+                        pronoun = "that" if len(unassigned) == 1 else "those"
+                        correction = (
+                            f"\n\nHold on — you ordered {items_str} but {verb} "
+                            f"in any package above. Which package should {pronoun} go into?"
+                        )
+                        yield f"data: {json.dumps({'token': correction})}\n\n"
+                        full_reply += correction
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+                updated_history = messages + [{"role": "assistant", "content": full_reply}]
+                yield f"data: {json.dumps({'done': True, 'conversation_history': updated_history})}\n\n"
+            except Exception as e:
+                print(f"ERROR in generate: {e}")
+                import traceback
+                traceback.print_exc()
+                yield f"data: {json.dumps({'token': f'Error: {str(e)}'})}\n\n"
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
+    except Exception as e:
+        print(f"ERROR in chat: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
 
 class OrderRequest(BaseModel):
     customer_name: str

@@ -10,16 +10,22 @@ import re
 from openai import OpenAI
 
 def validate_phones_in_message(message: str) -> str:
-    """Find digit sequences in message and append an authoritative validation note."""
-    matches = re.findall(r'\d{8,13}', message)
+    """Find phone numbers in message and append an authoritative validation note."""
+    # Match optional + followed by 8-13 digits
+    matches = re.findall(r'\+?\d{8,13}', message)
     if not matches:
         return message
     notes = []
     for m in matches:
-        if len(m) == 11:
-            notes.append(f"[SYSTEM VALIDATION: '{m}' = {len(m)} digits → VALID Nigerian phone number. Accept it.]")
+        digits = re.sub(r'\D', '', m)
+        # International format: +234XXXXXXXXXX (13 digits) or 234XXXXXXXXXX (13 digits)
+        if len(digits) == 13 and digits.startswith('234'):
+            local = '0' + digits[3:]
+            notes.append(f"[SYSTEM VALIDATION: '{m}' is a valid Nigerian number in international format (local equivalent: {local}). Accept it.]")
+        elif len(digits) == 11:
+            notes.append(f"[SYSTEM VALIDATION: '{m}' = 11 digits → VALID Nigerian phone number. Accept it.]")
         else:
-            notes.append(f"[SYSTEM VALIDATION: '{m}' = {len(m)} digits → INVALID. Ask customer to re-enter.]")
+            notes.append(f"[SYSTEM VALIDATION: '{m}' = {len(digits)} digits → INVALID. Ask customer to re-enter.]")
     return message + "\n\n" + " ".join(notes)
 
 def get_openai_client():

@@ -11,21 +11,24 @@ from openai import OpenAI
 
 def validate_phones_in_message(message: str) -> str:
     """Find phone numbers in message and append an authoritative validation note."""
-    # Match optional + followed by 8-13 digits
-    matches = re.findall(r'\+?\d{8,13}', message)
+    matches = re.findall(r'\+?\d{7,13}', message)
     if not matches:
         return message
     notes = []
     for m in matches:
         digits = re.sub(r'\D', '', m)
-        # International format: +234XXXXXXXXXX (13 digits) or 234XXXXXXXXXX (13 digits)
+        # International format: +234XXXXXXXXXX (13 digits)
         if len(digits) == 13 and digits.startswith('234'):
             local = '0' + digits[3:]
-            notes.append(f"[SYSTEM VALIDATION: '{m}' is a valid Nigerian number in international format (local equivalent: {local}). Accept it.]")
-        elif len(digits) == 11:
-            notes.append(f"[SYSTEM VALIDATION: '{m}' = 11 digits → VALID Nigerian phone number. Accept it.]")
+            notes.append(f"[SYSTEM VALIDATION: '{m}' is a valid Nigerian number in international format (local: {local}). Accept it.]")
+        # Standard Nigerian mobile: 11 digits starting with 0
+        elif len(digits) == 11 and digits.startswith('0'):
+            notes.append(f"[SYSTEM VALIDATION: '{m}' = 11 digits → VALID Nigerian mobile number. Accept it.]")
+        # Nigerian landline: 7-10 digits starting with 01, 02, 03, 04
+        elif 7 <= len(digits) <= 10 and re.match(r'^0[1-4]', digits):
+            notes.append(f"[SYSTEM VALIDATION: '{m}' is a valid Nigerian landline number. Accept it.]")
         else:
-            notes.append(f"[SYSTEM VALIDATION: '{m}' = {len(digits)} digits → INVALID. Ask customer to re-enter.]")
+            notes.append(f"[SYSTEM VALIDATION: '{m}' = {len(digits)} digits → INVALID Nigerian number. Ask customer to re-enter.]")
     return message + "\n\n" + " ".join(notes)
 
 def get_openai_client():

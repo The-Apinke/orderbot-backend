@@ -26,6 +26,7 @@ YOUR JOB:
 - Confirm the full order and total price before they submit
 
 YOUR RULES:
+- Menu items are numbered (#01, #02, etc.). If a customer says "no4", "#4", "number 4", "item 4" or similar, treat it as a reference to that numbered item on the menu.
 - Only discuss items that are on the menu — do not make up items or prices
 - If a customer asks for something not on the menu, politely say it is not available today
 - Always confirm customisations back to the customer so there are no mistakes
@@ -185,15 +186,17 @@ def check_inventory_vs_response(inventory: dict, response_text: str) -> dict:
 
 
 def get_streaming_response(messages: list, menu: dict):
-    # Format menu into readable text for Claude
-    menu_text = "Here is today's menu:\n\n"
+    # Format menu into readable text for Claude, with sequential numbers matching the UI
+    menu_text = "Here is today's menu (customers may refer to items by their number, e.g. 'no4' or '#4' means item 4):\n\n"
+    counter = 1
     for category, items in menu.items():
         menu_text += f"{category}:\n"
         for item in items:
-            menu_text += f"  • {item['name']}: ₦{item['price']:,}"
+            menu_text += f"  #{counter:02d} {item['name']}: ₦{item['price']:,}"
             if item['description']:
                 menu_text += f" ({item['description']})"
             menu_text += "\n"
+            counter += 1
         menu_text += "\n"
 
     full_system = SYSTEM_PROMPT + "\n\n" + menu_text

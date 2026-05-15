@@ -6,7 +6,21 @@ from fastapi.responses import StreamingResponse
 import json
 import os
 import io
+import re
 from openai import OpenAI
+
+def validate_phones_in_message(message: str) -> str:
+    """Find digit sequences in message and append an authoritative validation note."""
+    matches = re.findall(r'\d{8,13}', message)
+    if not matches:
+        return message
+    notes = []
+    for m in matches:
+        if len(m) == 11:
+            notes.append(f"[SYSTEM VALIDATION: '{m}' = {len(m)} digits → VALID Nigerian phone number. Accept it.]")
+        else:
+            notes.append(f"[SYSTEM VALIDATION: '{m}' = {len(m)} digits → INVALID. Ask customer to re-enter.]")
+    return message + "\n\n" + " ".join(notes)
 
 def get_openai_client():
     key = os.getenv("OPENAI_API_KEY")
@@ -71,8 +85,9 @@ async def chat(request: ChatRequest):
                 "price": item["price"]
             })
 
+        validated_message = validate_phones_in_message(request.message)
         messages = request.conversation_history + [
-            {"role": "user", "content": request.message}
+            {"role": "user", "content": validated_message}
         ]
 
         async def generate():

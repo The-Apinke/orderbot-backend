@@ -1,8 +1,10 @@
-from fastapi import APIRouter, UploadFile, File
+from fastapi import APIRouter, UploadFile, File, Request, Depends
 from pydantic import BaseModel, field_validator
 from app.database import supabase
-from app.agent import get_streaming_response, get_welcome_message, has_packaging_instructions, extract_order_inventory, check_inventory_vs_response
+from app.agent import get_streaming_response, has_packaging_instructions, extract_order_inventory, check_inventory_vs_response
+from app.auth import admin_required
 from fastapi.responses import StreamingResponse
+from app.main import limiter
 import json
 import os
 import io
@@ -64,8 +66,7 @@ def get_menu():
 
 @router.get("/chat/welcome")
 def welcome():
-    message = get_welcome_message()
-    return {"message": message}
+    return {"message": "Welcome — I'm Soji. Tell me what you want and how you want it. Or tap something from the menu below to get started."}
 
 @router.post("/chat/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
@@ -79,7 +80,8 @@ async def transcribe(audio: UploadFile = File(...)):
     return {"transcript": transcript.text}
 
 @router.post("/chat")
-async def chat(request: ChatRequest):
+@limiter.limit("15/minute")
+async def chat(request: Request, chat_request: ChatRequest):
     try:
         menu_response = supabase.table("menu_items").select("*").eq("available", True).execute()
 
@@ -94,8 +96,8 @@ async def chat(request: ChatRequest):
                 "price": item["price"]
             })
 
-        validated_message = validate_phones_in_message(request.message)
-        messages = request.conversation_history + [
+        validated_message = validate_phones_in_message(chat_request.message)
+        messages = chat_request.conversation_history + [
             {"role": "user", "content": validated_message}
         ]
 
@@ -105,8 +107,8 @@ async def chat(request: ChatRequest):
             try:
                 # Extract inventory before streaming if complex packaging order detected
                 inventory = {}
-                if has_packaging_instructions(request.message):
-                    inventory = extract_order_inventory(request.message)
+                if has_packaging_instructions(chat_request.message):
+                    inventory = extract_order_inventory(chat_request.message)
 
                 with get_streaming_response(messages, menu) as stream:
                     for text in stream.text_stream:
@@ -194,7 +196,7 @@ def create_order(order: OrderRequest):
         "order_id": response.data[0]["id"]
     }
 
-@router.get("/orders")
+@router.get("/orders", dependencies=[Depends(admin_required)])
 def get_orders():
     response = supabase.table("orders").select("*").order("created_at", desc=True).execute()
     return {"orders": response.data}
@@ -202,7 +204,7 @@ def get_orders():
 class OrderStatusUpdate(BaseModel):
     status: str
 
-@router.patch("/orders/{order_id}")
+@router.patch("/orders/{order_id}", dependencies=[Depends(admin_required)])
 def update_order_status(order_id: str, update: OrderStatusUpdate):
     response = supabase.table("orders").update({
         "status": update.status

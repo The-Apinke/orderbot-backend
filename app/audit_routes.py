@@ -1,8 +1,9 @@
 import json
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from app.auditor import extract_rules, generate_adversarial, stream_test_response, judge_response
+from app.auth import admin_required
 
 router = APIRouter(prefix="/audit", tags=["audit"])
 
@@ -11,7 +12,7 @@ class AuditRequest(BaseModel):
     system_prompt: str
 
 
-@router.post("")
+@router.post("", dependencies=[Depends(admin_required)])
 async def audit(request: AuditRequest):
     async def generate():
         # Phase 1: Extract rules

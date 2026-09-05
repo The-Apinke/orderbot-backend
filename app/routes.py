@@ -1,14 +1,20 @@
 from fastapi import APIRouter, UploadFile, File, Request, Depends
 from pydantic import BaseModel, field_validator
 from app.database import supabase
-from app.agent import get_streaming_response, has_packaging_instructions, extract_order_inventory, check_inventory_vs_response
+from app.agent import (
+    get_streaming_response, has_packaging_instructions, extract_order_inventory,
+    check_inventory_vs_response, PACKAGING_KEYWORDS,
+)
 from app.auth import admin_required
 from fastapi.responses import StreamingResponse
 from app.main import limiter
+from app.tracing import langfuse
+from app.redact import redact_phone_numbers
 import json
 import os
 import io
 import re
+from datetime import datetime, timezone
 from openai import OpenAI
 
 def validate_phones_in_message(message: str) -> str:
@@ -82,19 +88,31 @@ async def transcribe(audio: UploadFile = File(...)):
 @router.post("/chat")
 @limiter.limit("15/minute")
 async def chat(request: Request, chat_request: ChatRequest):
-    try:
-        menu_response = supabase.table("menu_items").select("*").eq("available", True).execute()
+    # One trace_id ties every span below to the same story: one customer
+    # message in, one reply out, with everything that happened in between.
+    trace_id = langfuse.create_trace_id()
 
-        menu = {}
-        for item in menu_response.data:
-            category = item["category"]
-            if category not in menu:
-                menu[category] = []
-            menu[category].append({
-                "name": item["name"],
-                "description": item["description"],
-                "price": item["price"]
-            })
+    try:
+        # --- Span 1: menu fetch ---------------------------------------
+        with langfuse.start_as_current_observation(
+            trace_context={"trace_id": trace_id},
+            name="menu_fetch",
+            as_type="span",
+            metadata={"session_id": chat_request.session_id, "table": "menu_items"},
+        ) as menu_span:
+            menu_response = supabase.table("menu_items").select("*").eq("available", True).execute()
+
+            menu = {}
+            for item in menu_response.data:
+                category = item["category"]
+                if category not in menu:
+                    menu[category] = []
+                menu[category].append({
+                    "name": item["name"],
+                    "description": item["description"],
+                    "price": item["price"]
+                })
+            menu_span.update(output={"item_count": sum(len(v) for v in menu.values())})
 
         validated_message = validate_phones_in_message(chat_request.message)
         messages = chat_request.conversation_history + [
@@ -105,29 +123,95 @@ async def chat(request: Request, chat_request: ChatRequest):
             full_reply = ""
 
             try:
-                # Extract inventory before streaming if complex packaging order detected
+                # --- Span 2: the packaging keyword gate -----------------
+                # A regex decision, not a model decision — the model never
+                # sees this happen. We log it so a missed keyword is
+                # findable later instead of invisible.
+                with langfuse.start_as_current_observation(
+                    trace_context={"trace_id": trace_id},
+                    name="packaging_gate",
+                    as_type="span",
+                ) as gate_span:
+                    matched_keyword = next(
+                        (kw for kw in PACKAGING_KEYWORDS if kw in chat_request.message.lower()),
+                        None
+                    )
+                    gate_matched = matched_keyword is not None
+                    gate_span.update(output={"matched": gate_matched, "matched_keyword": matched_keyword})
+                    # No separate "raw message" event here — it duplicated
+                    # what the main_chat_completion generation already
+                    # carries as its own input. One canonical copy, not two.
+
+                # --- Span 3 (conditional): inventory_extraction, wired in agent.py ---
                 inventory = {}
-                if has_packaging_instructions(chat_request.message):
-                    inventory = extract_order_inventory(chat_request.message)
+                if gate_matched:
+                    inventory = extract_order_inventory(chat_request.message, trace_id=trace_id)
 
-                with get_streaming_response(messages, menu) as stream:
-                    for text in stream.text_stream:
-                        full_reply += text
-                        yield f"data: {json.dumps({'token': text})}\n\n"
+                # --- Span 4: the main chat completion --------------------
+                # input/output on the generation itself are the canonical
+                # copy of what the customer said and what the model replied
+                # — this is what a "generation" is for, so no separate
+                # events duplicate it. Phone digits are redacted only in
+                # what's sent to Langfuse; the real digits still go to
+                # Claude (messages, below) and to the customer's own screen.
+                with langfuse.start_as_current_observation(
+                    trace_context={"trace_id": trace_id},
+                    name="main_chat_completion",
+                    as_type="generation",
+                    model="claude-haiku-4-5-20251001",
+                    input=redact_phone_numbers(validated_message),
+                ) as chat_gen:
+                    first_token_time = None
+                    with get_streaming_response(messages, menu) as stream:
+                        for text in stream.text_stream:
+                            if first_token_time is None:
+                                first_token_time = datetime.now(timezone.utc)
+                            full_reply += text
+                            yield f"data: {json.dumps({'token': text})}\n\n"
+                        final = stream.get_final_message()
 
-                # Python code verification — no AI involved
+                    u = final.usage
+                    chat_gen.update(
+                        output=redact_phone_numbers(full_reply),
+                        completion_start_time=first_token_time,
+                        usage_details={
+                            "input": u.input_tokens,
+                            "output": u.output_tokens,
+                            # Logged even at zero — see the caching-floor finding.
+                            "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
+                            "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0) or 0,
+                        },
+                    )
+
+                # --- Span 5: the Python inventory recount ----------------
+                # This is the span that matters most for trust: it's where
+                # the server sometimes writes words into the model's own
+                # reply that the model never generated.
                 if inventory:
-                    unassigned = check_inventory_vs_response(inventory, full_reply)
-                    if unassigned:
-                        items_str = ", ".join(f"{qty}x {item}" for item, qty in unassigned.items())
-                        verb = "it doesn't appear" if len(unassigned) == 1 else "they don't appear"
-                        pronoun = "that" if len(unassigned) == 1 else "those"
-                        correction = (
-                            f"\n\nHold on — you ordered {items_str} but {verb} "
-                            f"in any package above. Which package should {pronoun} go into?"
-                        )
-                        yield f"data: {json.dumps({'token': correction})}\n\n"
-                        full_reply += correction
+                    with langfuse.start_as_current_observation(
+                        trace_context={"trace_id": trace_id},
+                        name="inventory_recount",
+                        as_type="span",
+                    ) as recount_span:
+                        unassigned = check_inventory_vs_response(inventory, full_reply)
+                        if unassigned:
+                            items_str = ", ".join(f"{qty}x {item}" for item, qty in unassigned.items())
+                            verb = "it doesn't appear" if len(unassigned) == 1 else "they don't appear"
+                            pronoun = "that" if len(unassigned) == 1 else "those"
+                            correction = (
+                                f"\n\nHold on — you ordered {items_str} but {verb} "
+                                f"in any package above. Which package should {pronoun} go into?"
+                            )
+                            recount_span.update(output={"unassigned_found": True, "correction_injected": True})
+                            langfuse.create_event(
+                                name="correction_text_injected",
+                                output=correction,
+                                metadata={"note": "written by Python, never generated by the model"},
+                            )
+                            yield f"data: {json.dumps({'token': correction})}\n\n"
+                            full_reply += correction
+                        else:
+                            recount_span.update(output={"unassigned_found": False, "correction_injected": False})
 
                 updated_history = messages + [{"role": "assistant", "content": full_reply}]
                 yield f"data: {json.dumps({'done': True, 'conversation_history': updated_history})}\n\n"
@@ -136,6 +220,10 @@ async def chat(request: Request, chat_request: ChatRequest):
                 import traceback
                 traceback.print_exc()
                 yield f"data: {json.dumps({'token': f'Error: {str(e)}'})}\n\n"
+            finally:
+                # Flush now rather than waiting on the background batch —
+                # so a trace is visible in Langfuse right after one message.
+                langfuse.flush()
 
         return StreamingResponse(generate(), media_type="text/event-stream")
     except Exception as e:

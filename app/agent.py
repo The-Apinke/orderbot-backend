@@ -1,6 +1,8 @@
 import os
 import anthropic
 from dotenv import load_dotenv
+from app.tracing import langfuse
+from app.redact import redact_phone_numbers
 
 
 load_dotenv()
@@ -139,33 +141,49 @@ def has_packaging_instructions(message: str) -> bool:
     return any(kw in message_lower for kw in PACKAGING_KEYWORDS)
 
 
-def extract_order_inventory(message: str) -> dict:
-    """Focused call to extract ordered items and quantities as JSON."""
+def extract_order_inventory(message: str, trace_id: str = None) -> dict:
+    """Focused call to extract ordered items and quantities as JSON.
+
+    Span 3 in the tracing design: a conditional model call, so it only shows
+    up in Langfuse on turns where the packaging gate (span 2) fired.
+    """
     import json as _json
-    response = client.messages.create(
+
+    with langfuse.start_as_current_observation(
+        trace_context={"trace_id": trace_id} if trace_id else None,
+        name="inventory_extraction",
+        as_type="generation",
         model="claude-haiku-4-5-20251001",
-        max_tokens=200,
-        messages=[{
-            "role": "user",
-            "content": (
-                "Extract every food item and quantity from this order message. "
-                "Return ONLY a valid JSON object like {\"Beef Suya\": 2, \"Chicken Suya\": 10}. "
-                "No explanation, no extra text — just the JSON.\n\n"
-                f"Order: {message}"
-            )
-        }]
-    )
-    try:
-        text = response.content[0].text.strip()
-        # Strip markdown code fences if model wrapped JSON in them
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        return _json.loads(text.strip())
-    except Exception as e:
-        print(f"[inventory extraction failed] {e} — raw: {response.content[0].text!r}")
-        return {}
+        input=redact_phone_numbers(message),
+    ) as gen:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Extract every food item and quantity from this order message. "
+                    "Return ONLY a valid JSON object like {\"Beef Suya\": 2, \"Chicken Suya\": 10}. "
+                    "No explanation, no extra text — just the JSON.\n\n"
+                    f"Order: {message}"
+                )
+            }]
+        )
+        usage = {"input": response.usage.input_tokens, "output": response.usage.output_tokens}
+        try:
+            text = response.content[0].text.strip()
+            # Strip markdown code fences if model wrapped JSON in them
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            result = _json.loads(text.strip())
+            gen.update(output=result, usage_details=usage)
+            return result
+        except Exception as e:
+            print(f"[inventory extraction failed] {e} — raw: {response.content[0].text!r}")
+            gen.update(output={"error": str(e)}, usage_details=usage, level="ERROR")
+            return {}
 
 
 def check_inventory_vs_response(inventory: dict, response_text: str) -> dict:
